@@ -1,0 +1,16 @@
+{
+  "VCAP_SERVICES": {
+    "postgresql": [
+      {
+        "name": "my-local-db",
+        "label": "postgresql",
+        "tags": [
+          "postgres"
+        ],
+        "credentials": {
+          "uri": "postgres://postgres:mysecretpassword@localhost:5432/postgres"
+        }
+      }
+    ]
+  }
+}

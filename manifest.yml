@@ -1,0 +1,13 @@
+applications:
+  - name: sap-btp-node-extension
+    docker:
+      image: ilakrawchyk18/sap-btp-extension:latest
+    memory: 256M
+    disk_quota: 512M
+    instances: 1
+    default-route: true
+    env:
+      NODE_ENV: production
+    services:
+      - xsuaa-auth
+      - my-postgres-db
