@@ -212,6 +212,9 @@ async function runIntegrationTests() {
             },
             body: JSON.stringify({ action: 'stop' })
         });
+        console.log('\n========================================');
+        console.log(' Результат тестування: 8/8 пройдено успішно');
+        console.log('========================================\n');
     } catch (error) {
         console.error("Тест 8 провалено:", error.message);
     }

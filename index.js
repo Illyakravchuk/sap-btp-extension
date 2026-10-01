@@ -110,11 +110,48 @@ app.get('/api/system/metrics', requireAuth, (req, res) => {
     });
 });
 
+// Прогнозування ресурсів 
+const cpuHistory = [];
+const HISTORY_LIMIT = 10; 
+
+function predictCpuLoadML(currentLoad) {
+    // 1. Оновлюємо історію 
+    if (cpuHistory.length >= HISTORY_LIMIT) {
+        cpuHistory.shift(); 
+    }
+    cpuHistory.push(currentLoad);
+
+    // 2. Якщо даних замало для побудови тренду, то беремо базову оцінку
+    if (cpuHistory.length < 3) {
+        return currentLoad * 1.25; 
+    }
+
+    // 3. Алгоритм простої лінійної регресії
+    let sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
+    const n = cpuHistory.length;
+
+    for (let i = 0; i < n; i++) {
+        sumX += i;            
+        sumY += cpuHistory[i]; 
+        sumXY += i * cpuHistory[i];
+        sumXX += i * i;
+    }
+
+    const slope = (n * sumXY - sumX * sumY) / (n * sumXX - sumX * sumX);
+    const intercept = (sumY - slope * sumX) / n;
+
+    // 4. Прогнозуємо наступне значення (X = n)
+    let predictedLoad = (slope * n) + intercept;
+
+    // 5. Нормалізуємо результат
+    return Math.max(0, Math.min(100, predictedLoad));
+}
+
 app.get('/api/system/forecast', requireAuth, (req, res) => {
     let actualCpu = parseFloat(latestCpuPercent) || 0;
     
-    let forecastCpu = actualCpu * 1.25; 
-    if (forecastCpu > 100) forecastCpu = 100;
+    // Викликаємо алгоритм для прогнозу
+    let forecastCpu = predictCpuLoadML(actualCpu); 
 
     let status = "NORMAL";
     let message = "Поточна ємність кластера достатня.";

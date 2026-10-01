@@ -232,7 +232,7 @@ async function renderForecast(isAutoRefresh = false) {
                 <div class="progress-bar bg-primary" style="width: ${data.current}%"></div>
             </div>
             <div class="mb-1 d-flex justify-content-between">
-                <small>Прогноз (тренд +25%)</small>
+                <small>Прогноз навантаження</small>
                 <small class="fw-bold">${data.forecast}%</small>
             </div>
             <div class="progress mb-3" style="height: 8px;">
