@@ -1,3 +1,4 @@
 node_modules
 default-services.json
 .git
+.env

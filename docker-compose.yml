@@ -1,0 +1,14 @@
+version: '3.8'
+services:
+  sap-extension:
+    build: .
+    image: ilakrawchyk18/sap-btp-extension:latest
+    container_name: sap-btp-core
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+      - MEMORY_LIMIT=256M
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD}
+      - OPERATOR_PASSWORD=${OPERATOR_PASSWORD}

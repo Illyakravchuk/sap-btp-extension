@@ -1,89 +1,104 @@
 const express = require('express');
 const os = require('os');
-const { performance } = require('perf_hooks');
-const { Client } = require('pg');
+const path = require('path'); 
 const xsenv = require('@sap/xsenv'); 
 
-const passport = require('passport');
-const { XssecPassportStrategy, XsuaaService } = require('@sap/xssec'); 
+// Імпорт модулів
+const { connectDB, getDbClient } = require('./database');
+const { configureSecurity, requireAuth, requireRole, getAuthStatus } = require('./security');
 
 const app = express();
 const port = process.env.PORT || 8080;
 app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
 
-// --- МОДЕЛЬ БЕЗПЕКИ ---
-let isAuthEnabled = false;
-try {
-    const services = xsenv.getServices({ uaa: { name: 'xsuaa-auth' } });
-    
-    const xsuaaService = new XsuaaService(services.uaa);
-    passport.use('JWT', new XssecPassportStrategy(xsuaaService));
-    
-    app.use(passport.initialize());
-    isAuthEnabled = true;
-    console.log("XSUAA Security: Enabled (v4 Strategy)");
-} catch (err) {
-    console.log("XSUAA Security: Disabled. Причина:", err.message);
-}
+// Ініціалізація інфраструктури
+configureSecurity(app);
+connectDB();
 
-const requireAuth = (req, res, next) => {
-    if (isAuthEnabled) {
-        return passport.authenticate('JWT', { session: false })(req, res, next);
-    }
-    return res.status(500).json({ error: "Security Configuration Error: XSUAA is offline." });
+// МОДЕЛЬ ДАНИХ ТА ЖУРНАЛ
+let appState = {
+    instances: 1,
+    status: 'RUNNING'
 };
 
-// --- МОДЕЛЬ ДАНИХ ---
-let dbClient = null;
-try {
-    const dbServices = xsenv.getServices({ 
-        db: { name: 'my-postgres-db' } 
-    });
-    
-    dbClient = new Client({
-        connectionString: dbServices.db.uri,
-        ssl: { rejectUnauthorized: false } 
-    });
-    
-    dbClient.connect()
-        .then(() => {
-            console.log("Database: Connected to SAP BTP PostgreSQL");
-            
-            const createTableQuery = `
-                CREATE TABLE IF NOT EXISTS research_metrics (
-                    id SERIAL PRIMARY KEY,
-                    exp_id VARCHAR(50),
-                    iterations BIGINT,
-                    exec_time NUMERIC,
-                    load_before NUMERIC,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                );
-            `;
-            return dbClient.query(createTableQuery);
-        })
-        .then(() => console.log("Database schema is ready"))
-        .catch(err => console.error("Database Connection/Setup Error:", err.message));
+const systemLogs = [];
+const addLog = (level, message) => {
+    const logEntry = { timestamp: new Date().toISOString(), level, message };
+    systemLogs.unshift(logEntry);
+    if (systemLogs.length > 50) systemLogs.pop(); 
+};
 
-} catch (err) {
-    console.log("Database Config Error:", err.message);
-}
+addLog("INFO", "Систему ініціалізовано. Контейнер запущено.");
+if (getAuthStatus()) addLog("SUCCESS", "XSUAA Security успішно підключено.");
+else addLog("WARNING", "Локальний режим: SAP-сервіси недоступні.");
 
-let deployments = [
-    { id: 'cf-app-001', name: 'sap-btp-extension-core', status: 'RUNNING', instances: 1, memory_quota: '256M', cpu_usage: '12%' },
-    { id: 'cf-app-002', name: 'sap-btp-auth-service', status: 'STOPPED', instances: 0, memory_quota: '128M', cpu_usage: '0%' }
-];
+// МАРШРУТИ API
+app.get('/api/system/logs', requireAuth, (req, res) => {
+    res.status(200).json(systemLogs);
+});
 
-// --- МАРШРУТИ ---
+app.post('/api/auth/auto-token', async (req, res) => {
+    const { role, password } = req.body;
+    const VALID_ADMIN_PASS = process.env.ADMIN_PASSWORD || "SecretAdmin1!";
+    const VALID_OPERATOR_PASS = process.env.OPERATOR_PASSWORD || "OperatorPass!";
+
+    if (role === 'Admin' && password !== VALID_ADMIN_PASS) return res.status(401).json({ error: "Невірний пароль Адміністратора." });
+    if (role === 'Operator' && password !== VALID_OPERATOR_PASS) return res.status(401).json({ error: "Невірний пароль Оператора." });
+
+    if (!getAuthStatus()) {
+        addLog("SUCCESS", `[Локальний сервер] Вхід під роллю ${role}.`);
+        return res.status(200).json({ access_token: "local-server-mock-token" });
+    }
+
+    try {
+        const uaa = xsenv.getServices({ uaa: { name: 'xsuaa-auth' } }).uaa;
+        const credentials = Buffer.from(`${uaa.clientid}:${uaa.clientsecret}`).toString('base64');
+        const response = await fetch(`${uaa.url}/oauth/token?grant_type=client_credentials`, {
+            method: 'POST',
+            headers: { 'Authorization': `Basic ${credentials}`, 'Content-Type': 'application/x-www-form-urlencoded' }
+        });
+        const data = await response.json();
+        if (data.access_token) {
+            addLog("SUCCESS", `Успішний вхід (SAP XSUAA) під роллю ${role}.`);
+            res.status(200).json({ access_token: data.access_token });
+        } else {
+            res.status(400).json({ error: "Помилка токена SAP XSUAA" });
+        }
+    } catch (err) {
+        res.status(500).json({ error: "Internal Auth Error: " + err.message });
+    }
+});
 
 app.get('/api/system/metrics', requireAuth, (req, res) => {
     const vcapApp = process.env.VCAP_APPLICATION ? JSON.parse(process.env.VCAP_APPLICATION) : null;
     
+    //  Базовий ліміт одного інстансу (256 МБ)
+    let baseMemLimit = 256;
+    if (process.env.MEMORY_LIMIT) {
+        baseMemLimit = parseInt(process.env.MEMORY_LIMIT);
+        if (process.env.MEMORY_LIMIT.toUpperCase().includes('G')) baseMemLimit *= 1024;
+    }
+
+    // Множимо ліміт на кількість активних інстансів (Сумарна ємність кластера)
+    const activeInstances = appState.instances > 0 ? appState.instances : 1;
+    const totalClusterMemMB = baseMemLimit * activeInstances;
+
+    //  Множимо споживання пам'яті процесу на кількість інстансів
+    const baseUsedMem = Math.round(process.memoryUsage().rss / 1024 / 1024);
+    const totalUsedMemMB = baseUsedMem * activeInstances;
+    
+    let freeMemMB = totalClusterMemMB - totalUsedMemMB;
+    if (freeMemMB < 0) freeMemMB = 0;
+
     res.status(200).json({
         status: "success",
-        environment: vcapApp ? "SAP BTP Cloud Foundry" : "Local Docker Container",
+        environment: vcapApp ? "SAP BTP Cloud Foundry" : "Local Server Mode",
         container_host: os.hostname(),
         metrics: {
-            free_mem: Math.round(os.freemem() / 1024 / 1024) + ' MB',
+            used_mem: totalUsedMemMB + ' MB',
+            free_mem: freeMemMB + ' MB',
+            total_mem: totalClusterMemMB + ' MB',
             load_avg: os.loadavg(),
             uptime: os.uptime() + 's'
         },
@@ -95,47 +110,110 @@ app.get('/api/system/metrics', requireAuth, (req, res) => {
     });
 });
 
-app.post('/api/research/benchmark', requireAuth, async (req, res) => {
-    const iterations = req.body.iterations || 1000000;
-    const start = performance.now();
+app.get('/api/system/forecast', requireAuth, (req, res) => {
+    let actualCpu = parseFloat(latestCpuPercent) || 0;
     
+    let forecastCpu = actualCpu * 1.25; 
+    if (forecastCpu > 100) forecastCpu = 100;
+
+    let status = "NORMAL";
+    let message = "Поточна ємність кластера достатня.";
+    let theme = "success"; 
+
+    if (forecastCpu >= 80) {
+        status = "CRITICAL";
+        message = "УВАГА: Ризик перевантаження! Рекомендується Scale-Out (+1 інстанс).";
+        theme = "danger";
+    } else if (forecastCpu >= 50) {
+        status = "WARNING";
+        message = "Обчислювальних ресурсів достатньо."; 
+        theme = "warning";
+    }
+
+    res.status(200).json({
+        current: actualCpu.toFixed(1),
+        forecast: forecastCpu.toFixed(1),
+        status: status,
+        message: message,
+        theme: theme 
+    });
+});
+
+app.get('/api/integration/destinations', requireAuth, (req, res) => {
+    const isCloud = process.env.VCAP_APPLICATION ? true : false;
+
+    res.status(200).json({
+        destinations: [
+            { 
+                name: "S4HANA_Cloud", 
+                type: "HTTP", 
+                auth: "OAuth2SAMLBearerAssertion", 
+                status: isCloud ? "Active" : "Offline (Local)" 
+            },
+            { 
+                name: "SuccessFactors", 
+                type: "HTTP", 
+                auth: "BasicAuthentication", 
+                status: "Inactive" 
+            }
+        ]
+    });
+});
+
+// ФОНОВИЙ ГЕНЕРАТОР НАВАНТАЖЕННЯ
+let currentLoadIntensity = 0; 
+let isStressing = false;
+
+// Функція, яка постійно виконується у фоновому режимі
+function runStressLoop() {
+    if (currentLoadIntensity <= 0) {
+        isStressing = false;
+        return;
+    }
+    
+    const workDuration = currentLoadIntensity * 5; 
+    const start = Date.now();
     let result = 0;
-    for (let i = 0; i < iterations; i++) {
-        result += Math.sqrt(i) * Math.sin(i);
+    while (Date.now() - start < workDuration) {
+        result += Math.sqrt(Math.random()); 
     }
     
-    const end = performance.now();
-    const executionTime = (end - start).toFixed(4);
-    
-    const experimentData = {
-        experiment_id: "EXP-" + Date.now(),
-        iterations: iterations,
-        execution_time_ms: executionTime,
-        system_load_before: os.loadavg()[0]
-    };
+    setTimeout(runStressLoop, 10);
+}
 
-    if (dbClient) {
-        try {
-            await dbClient.query(
-                'INSERT INTO research_metrics(exp_id, iterations, exec_time, load_before) VALUES($1, $2, $3, $4)',
-                [experimentData.experiment_id, iterations, executionTime, experimentData.system_load_before]
-            );
-            experimentData.saved_to_db = true;
-        } catch (dbErr) {
-            console.error("DB Save Error:", dbErr);
-            experimentData.saved_to_db = false;
-        }
-    } else {
-        experimentData.saved_to_db = false;
+// API для керування генератором
+app.post('/api/research/load', requireAuth, (req, res) => {
+    const userRole = req.headers['x-demo-role'];
+    if (userRole !== 'Admin') {
+        addLog("WARNING", `Security: Відхилено спробу зміни навантаження. Роль ${userRole} не має доступу.`);
+        return res.status(403).json({ error: "Access Denied. Тільки Administrator може керувати навантаженням." });
     }
 
-    res.status(200).json(experimentData);
+    const { action } = req.body;
+    let previousIntensity = currentLoadIntensity;
+    
+    if (action === 'increase' && currentLoadIntensity < 10) currentLoadIntensity++;
+    if (action === 'decrease' && currentLoadIntensity > 0) currentLoadIntensity--;
+    if (action === 'stop') currentLoadIntensity = 0;
+
+    if (currentLoadIntensity > 0 && !isStressing) {
+        isStressing = true;
+        runStressLoop(); 
+        addLog("WARNING", `Фонове навантаження активовано. Рівень: ${currentLoadIntensity}/10`);
+    } else if (currentLoadIntensity === 0 && isStressing) {
+        isStressing = false;
+        addLog("INFO", "Фонове навантаження повністю зупинено.");
+    } else if (isStressing && currentLoadIntensity !== previousIntensity) {
+        const direction = currentLoadIntensity > previousIntensity ? "збільшено" : "зменшено";
+        addLog("INFO", `Рівень навантаження ${direction} до ${currentLoadIntensity}/10`);
+    }
+
+    res.status(200).json({ intensity: currentLoadIntensity });
 });
 
 app.get('/api/research/history', requireAuth, async (req, res) => {
-    if (!dbClient) {
-        return res.status(501).json({ error: "Database not connected. History unavailable." });
-    }
+    const dbClient = getDbClient();
+    if (!dbClient) return res.status(501).json({ error: "Database not connected." });
     try {
         const result = await dbClient.query('SELECT * FROM research_metrics ORDER BY id DESC LIMIT 20');
         res.status(200).json({ count: result.rowCount, data: result.rows });
@@ -144,36 +222,76 @@ app.get('/api/research/history', requireAuth, async (req, res) => {
     }
 });
 
+let lastTime = Date.now();
+let lastCpu = process.cpuUsage();
+let latestCpuPercent = 0;
+
 app.get('/api/deployments', requireAuth, (req, res) => {
-    res.status(200).json({
-        total_deployments: deployments.length,
-        timestamp: new Date().toISOString(),
-        data: deployments
+    const memLimit = process.env.MEMORY_LIMIT || '256 MB';
+
+    const now = Date.now();
+    const timeDiff = now - lastTime;
+    
+    const cpuDiff = process.cpuUsage(lastCpu);
+    const cpuUsedMs = (cpuDiff.user + cpuDiff.system) / 1000;
+
+    lastTime = now;
+    lastCpu = process.cpuUsage();
+
+    let rawCpuPercent = 0;
+    if (timeDiff > 0) {
+        rawCpuPercent = (cpuUsedMs / timeDiff) * 100;
+    }
+
+    let currentCpu = appState.instances > 0 ? (rawCpuPercent / appState.instances).toFixed(1) : 0;
+    latestCpuPercent = currentCpu; 
+
+    const dynamicDeployments = [
+        { 
+            id: 'cf-app-001', 
+            name: 'sap-btp-node-extension', 
+            status: appState.instances > 0 ? 'RUNNING' : 'STOPPED', 
+            instances: appState.instances, 
+            memory_quota: memLimit, 
+            cpu_usage: `${currentCpu}%` 
+        }
+    ];
+
+    res.status(200).json({ 
+        total_deployments: dynamicDeployments.length, 
+        timestamp: new Date().toISOString(), 
+        data: dynamicDeployments,
+        currentLoadIntensity: typeof currentLoadIntensity !== 'undefined' ? currentLoadIntensity : 0 
     });
 });
 
 app.post('/api/deployments/:id/scale', requireAuth, (req, res) => {
+    const userRole = req.headers['x-demo-role'];
+    if (userRole !== 'Admin') {
+        addLog("WARNING", `Security: Відхилено спробу масштабування. Роль ${userRole} не має прав (Required: Admin).`);
+        return res.status(403).json({ error: "Access Denied. Тільки Administrator може масштабувати сервіс." });
+    }
+
     const { id } = req.params;
     const { target_instances } = req.body;
-
+    
     if (target_instances === undefined || target_instances < 0) {
         return res.status(400).json({ error: "Invalid instance count" });
     }
 
-    const appIndex = deployments.findIndex(d => d.id === id);
-    if (appIndex === -1) {
-        return res.status(404).json({ error: "Deployment not found" });
+    appState.instances = target_instances;
+    appState.status = target_instances > 0 ? 'RUNNING' : 'STOPPED';
+
+    lastTime = Date.now();
+    lastCpu = process.cpuUsage();
+
+    if (target_instances > 0) {
+        addLog("SUCCESS", `Масштабування ${id} до ${target_instances} шт. Навантаження розподілено між інстансами.`);
+    } else {
+        addLog("WARNING", `Сервіс ${id} повністю зупинено.`);
     }
-
-    deployments[appIndex].instances = target_instances;
-    deployments[appIndex].status = target_instances > 0 ? 'RUNNING' : 'STOPPED';
-
-    res.status(200).json({
-        message: `Deployment ${id} scaling initiated`,
-        updated_state: deployments[appIndex]
-    });
+    
+    res.status(200).json({ message: `Deployment ${id} scaling initiated` });
 });
 
-app.listen(port, () => {
-    console.log(`SAP BTP Advanced Manager API is running on port ${port}`);
-});
+app.listen(port, () => console.log(`SAP BTP Advanced Manager API is running on port ${port}`));

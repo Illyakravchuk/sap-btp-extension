@@ -4,7 +4,8 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node index.js",
+    "test": "node test.js"
   },
   "keywords": [],
   "author": "",
@@ -13,6 +14,7 @@
     "@sap/xsenv": "^6.2.0",
     "@sap/xssec": "^4.13.0",
     "express": "^5.2.1",
+    "node-fetch": "^2.7.0",
     "passport": "^0.7.0",
     "pg": "^8.20.0"
   }

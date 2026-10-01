@@ -1,0 +1,26 @@
+{
+  "xsappname": "sap-btp-extension-auth",
+  "tenant-mode": "dedicated",
+  "scopes": [
+    {
+      "name": "$XSAPPNAME.Admin",
+      "description": "Administrator Access for Critical Operations"
+    },
+    {
+      "name": "$XSAPPNAME.Operator",
+      "description": "Operator Access for Monitoring"
+    }
+  ],
+  "role-templates": [
+    {
+      "name": "SystemAdministrator",
+      "description": "Role for Admins",
+      "scope-references": [ "$XSAPPNAME.Admin", "$XSAPPNAME.Operator" ]
+    },
+    {
+      "name": "SystemOperator",
+      "description": "Role for Operators",
+      "scope-references": [ "$XSAPPNAME.Operator" ]
+    }
+  ]
+}
